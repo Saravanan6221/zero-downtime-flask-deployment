@@ -1,15 +1,20 @@
-```bash
+
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
 
-# --------------------------------------------------
-# 1. Deployment variables
-# --------------------------------------------------
+# ==========================================================
+# ZERO-DOWNTIME FLASK DEPLOYMENT
+# Docker + Nginx + AWS EC2
+# ==========================================================
+
+# Arguments passed by Jenkins
 
 IMAGE="${1:?Usage: deploy.sh IMAGE BUILD_ID [SIMULATE_FAILURE]}"
 BUILD_ID="${2:?Build ID is required}"
 SIMULATE_FAILURE="${3:-false}"
+
+# Application configuration
 
 APP_DIR="/opt/bluegreen"
 UPSTREAM_FILE="/etc/nginx/active-upstream.inc"
@@ -17,62 +22,80 @@ UPSTREAM_FILE="/etc/nginx/active-upstream.inc"
 CURRENT_FILE="$APP_DIR/current-port"
 PREVIOUS_FILE="$APP_DIR/previous-port"
 
-BACKUP_FILE="$APP_DIR/upstream-before-$BUILD_ID.conf"
+BACKUP_FILE="$APP_DIR/upstream-backup-$BUILD_ID.conf"
 
-# Validate build ID
-if [[ ! "$BUILD_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
-    echo "ERROR: Invalid build ID"
+# Deployment state
+
+DEPLOY_SUCCESS=false
+CANDIDATE_STARTED=false
+UPSTREAM_CHANGED=false
+HAD_ACTIVE=false
+
+# ==========================================================
+# STEP 1: CHECK ROOT PRIVILEGES
+# ==========================================================
+
+if [[ "$EUID" -ne 0 ]]; then
+    echo "ERROR: Run this script using sudo."
     exit 1
 fi
 
-if [[ "$SIMULATE_FAILURE" != "true" && "$SIMULATE_FAILURE" != "false" ]]; then
-    echo "ERROR: SIMULATE_FAILURE must be true or false"
-    exit 1
-fi
-
-mkdir -p "$APP_DIR"
-
 echo "=========================================="
-echo "ZERO-DOWNTIME BLUE-GREEN DEPLOYMENT"
+echo "ZERO-DOWNTIME DEPLOYMENT STARTED"
 echo "=========================================="
-echo "Image: $IMAGE"
+
+echo "Docker image: $IMAGE"
 echo "Build ID: $BUILD_ID"
 echo "Simulate failure: $SIMULATE_FAILURE"
 
-# --------------------------------------------------
-# 2. Validate Nginx configuration files
-# --------------------------------------------------
+# ==========================================================
+# STEP 2: CHECK REQUIRED COMMANDS
+# ==========================================================
 
-if [[ ! -f "$UPSTREAM_FILE" ]]; then
-    echo "ERROR: Nginx upstream file not found: $UPSTREAM_FILE"
-    exit 1
+for command in docker nginx curl systemctl grep awk head seq sleep cp mkdir mv; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+        echo "ERROR: Required command not found: $command"
+        exit 1
+    fi
+done
+
+# ==========================================================
+# STEP 3: PREPARE APPLICATION DIRECTORY
+# ==========================================================
+
+mkdir -p "$APP_DIR"
+
+# ==========================================================
+# STEP 4: CHECK NGINX UPSTREAM CONFIGURATION
+# ==========================================================
+
+if [[ ! -s "$UPSTREAM_FILE" ]]; then
+
+    echo "Creating initial Nginx upstream configuration."
+
+    printf '%s\n' \
+        "server 127.0.0.1:5001 max_fails=3 fail_timeout=10s;" \
+        > "$UPSTREAM_FILE"
 fi
-
-if [[ ! -f /etc/nginx/conf.d/default.conf ]]; then
-    echo "ERROR: Nginx default.conf not found"
-    exit 1
-fi
-
-# --------------------------------------------------
-# 3. Identify currently active application
-# --------------------------------------------------
 
 CURRENT_PORT="$(
     grep -oE '127\.0\.0\.1:500[12]' "$UPSTREAM_FILE" |
     head -n 1 |
-    cut -d ':' -f 2 || true
+    awk -F: '{print $2}' || true
 )"
 
-CURRENT_PORT="${CURRENT_PORT:-5001}"
-
 if [[ "$CURRENT_PORT" != "5001" && "$CURRENT_PORT" != "5002" ]]; then
-    echo "ERROR: Invalid active application port: $CURRENT_PORT"
+    echo "ERROR: Invalid Nginx upstream configuration."
     exit 1
 fi
 
+# ==========================================================
+# STEP 5: IDENTIFY ACTIVE CONTAINER
+# ==========================================================
+
 CURRENT_CONTAINER="bluegreen-$CURRENT_PORT"
 
-if docker ps --format '{{.Names}}' | grep -Fxq "$CURRENT_CONTAINER"; then
+if docker ps --format '{{.Names}}' | grep -qx "$CURRENT_CONTAINER"; then
 
     HAD_ACTIVE=true
 
@@ -92,105 +115,125 @@ fi
 NEW_CONTAINER="bluegreen-$NEW_PORT"
 
 echo "Current port: $CURRENT_PORT"
-echo "Candidate port: $NEW_PORT"
-echo "Previous application running: $HAD_ACTIVE"
+echo "New deployment port: $NEW_PORT"
+echo "Current container: $CURRENT_CONTAINER"
+echo "New container: $NEW_CONTAINER"
 
-# --------------------------------------------------
-# 4. Backup existing Nginx configuration
-# --------------------------------------------------
+# ==========================================================
+# STEP 6: BACK UP CURRENT NGINX CONFIGURATION
+# ==========================================================
 
 cp "$UPSTREAM_FILE" "$BACKUP_FILE"
 
-CANDIDATE_STARTED=false
-DEPLOY_SUCCESS=false
+echo "Nginx upstream backup created: $BACKUP_FILE"
 
-# --------------------------------------------------
-# 5. Automatic rollback function
-# --------------------------------------------------
+# ==========================================================
+# STEP 7: AUTOMATIC ROLLBACK FUNCTION
+# ==========================================================
 
-rollback_on_error() {
+rollback_on_exit() {
 
-    EXIT_CODE=$?
+    local EXIT_CODE=$?
 
-    trap - ERR
+    trap - EXIT
 
     if [[ "$DEPLOY_SUCCESS" != "true" ]]; then
 
         echo ""
         echo "=========================================="
-        echo "DEPLOYMENT FAILED - STARTING ROLLBACK"
+        echo "DEPLOYMENT FAILED - ROLLBACK STARTED"
         echo "=========================================="
 
-        if [[ -f "$BACKUP_FILE" ]]; then
+        # Restore previous Nginx upstream.
 
-            cp "$BACKUP_FILE" "$UPSTREAM_FILE"
+        if [[ "$UPSTREAM_CHANGED" == "true" ]]; then
 
-            if nginx -t; then
-                systemctl reload nginx
-                echo "Previous Nginx configuration restored."
-            else
-                echo "WARNING: Nginx configuration validation failed during rollback."
+            if [[ -f "$BACKUP_FILE" ]]; then
+
+                cp "$BACKUP_FILE" "$UPSTREAM_FILE"
+
+                if nginx -t; then
+
+                    systemctl reload nginx
+
+                    echo "Previous Nginx upstream restored."
+
+                else
+
+                    echo "WARNING: Restored Nginx configuration is invalid."
+
+                fi
+
             fi
 
         fi
 
+        # Remove failed candidate container.
+
         if [[ "$CANDIDATE_STARTED" == "true" ]]; then
 
-            docker rm -f "$NEW_CONTAINER" >/dev/null 2>&1 || true
+            docker rm -f "$NEW_CONTAINER" \
+                >/dev/null 2>&1 || true
 
-            echo "Failed candidate container removed: $NEW_CONTAINER"
+            echo "Failed candidate container removed."
 
         fi
 
         if [[ "$HAD_ACTIVE" == "true" ]]; then
-            echo "Previous application retained: $CURRENT_CONTAINER"
+            echo "Previous application container retained."
         else
-            echo "No previous working application existed."
+            echo "No previous application existed for initial rollback."
         fi
 
-        echo "Rollback procedure completed."
+        echo "=========================================="
+        echo "ROLLBACK PROCEDURE FINISHED"
+        echo "=========================================="
 
     fi
 
     exit "$EXIT_CODE"
 }
 
-trap rollback_on_error ERR
+trap rollback_on_exit EXIT
 
-# --------------------------------------------------
-# 6. Pull new Docker image
-# --------------------------------------------------
+# ==========================================================
+# STEP 8: VALIDATE EXISTING NGINX CONFIGURATION
+# ==========================================================
 
-echo ""
-echo "Pulling candidate Docker image..."
+echo "Validating existing Nginx configuration."
+
+nginx -t
+
+# ==========================================================
+# STEP 9: PULL DOCKER IMAGE
+# ==========================================================
+
+echo "Pulling Docker image: $IMAGE"
 
 docker pull "$IMAGE"
 
-# --------------------------------------------------
-# 7. Remove stale candidate container if present
-# --------------------------------------------------
+# ==========================================================
+# STEP 10: REMOVE OLD INACTIVE CANDIDATE
+# ==========================================================
 
-echo "Preparing candidate container..."
+echo "Removing any old candidate container."
 
-docker rm -f "$NEW_CONTAINER" >/dev/null 2>&1 || true
+docker rm -f "$NEW_CONTAINER" \
+    >/dev/null 2>&1 || true
 
-# --------------------------------------------------
-# 8. Configure simulated failure
-# --------------------------------------------------
+# ==========================================================
+# STEP 11: START NEW CANDIDATE CONTAINER
+# ==========================================================
 
 FAIL_FLAG=false
 
 if [[ "$SIMULATE_FAILURE" == "true" ]]; then
     FAIL_FLAG=true
-    echo "SIMULATION ENABLED: Candidate health check will fail."
 fi
 
-# --------------------------------------------------
-# 9. Start candidate container
-# --------------------------------------------------
+echo "Starting candidate application."
 
-echo ""
-echo "Starting candidate application..."
+CANDIDATE_STARTED=true
 
 docker run -d \
     --restart unless-stopped \
@@ -199,112 +242,175 @@ docker run -d \
     -p "127.0.0.1:$NEW_PORT:5000" \
     "$IMAGE"
 
-CANDIDATE_STARTED=true
+echo "Candidate container started."
 
-echo "Candidate container started: $NEW_CONTAINER"
+# ==========================================================
+# STEP 12: CHECK CANDIDATE APPLICATION HEALTH
+# ==========================================================
 
-# --------------------------------------------------
-# 10. Candidate health check
-# --------------------------------------------------
-
-echo ""
-echo "Checking candidate application health..."
+echo "Checking candidate application health."
 
 HEALTHY=false
 
-for ((i=1; i<=15; i++)); do
+for attempt in $(seq 1 20); do
 
-    if curl --fail --silent --max-time 3 \
-        "http://127.0.0.1:$NEW_PORT/health" >/dev/null; then
+    if curl \
+        --fail \
+        --silent \
+        --max-time 3 \
+        "http://127.0.0.1:$NEW_PORT/health" \
+        >/dev/null; then
 
         HEALTHY=true
-        echo "Candidate health check passed."
+
+        echo "Candidate health check successful."
+
         break
 
     fi
 
-    echo "Health check attempt $i failed."
+    echo "Health check attempt $attempt/20 failed."
 
     sleep 2
 
 done
 
 if [[ "$HEALTHY" != "true" ]]; then
+
     echo "ERROR: Candidate application is unhealthy."
+
     exit 1
+
 fi
 
-# --------------------------------------------------
-# 11. Switch Nginx traffic to candidate
-# --------------------------------------------------
+# ==========================================================
+# STEP 13: SAVE PREVIOUS ACTIVE PORT
+# ==========================================================
 
-echo ""
-echo "Switching Nginx traffic..."
+if [[ "$HAD_ACTIVE" == "true" ]]; then
 
-printf 'server 127.0.0.1:%s max_fails=3 fail_timeout=10s;\n' \
-    "$NEW_PORT" > "$UPSTREAM_FILE"
+    printf '%s\n' "$CURRENT_PORT" > "$PREVIOUS_FILE"
+
+    echo "Previous active port saved: $CURRENT_PORT"
+
+fi
+
+# ==========================================================
+# STEP 14: SWITCH NGINX TO NEW APPLICATION
+# ==========================================================
+
+echo "Switching Nginx traffic to candidate."
+
+UPSTREAM_CHANGED=true
+
+TEMP_UPSTREAM="${UPSTREAM_FILE}.tmp"
+
+printf '%s\n' \
+    "server 127.0.0.1:$NEW_PORT max_fails=3 fail_timeout=10s;" \
+    > "$TEMP_UPSTREAM"
+
+mv "$TEMP_UPSTREAM" "$UPSTREAM_FILE"
+
+# ==========================================================
+# STEP 15: VALIDATE NGINX CONFIGURATION
+# ==========================================================
+
+echo "Testing updated Nginx configuration."
 
 nginx -t
 
+# ==========================================================
+# STEP 16: RELOAD NGINX
+# ==========================================================
+
+echo "Reloading Nginx."
+
 systemctl reload nginx
 
-echo "Nginx traffic switched to port $NEW_PORT"
+# ==========================================================
+# STEP 17: VERIFY THROUGH NGINX
+# ==========================================================
 
-# --------------------------------------------------
-# 12. Verify application through Nginx
-# --------------------------------------------------
+echo "Verifying application through Nginx."
 
-echo ""
-echo "Verifying application through Nginx..."
+NGINX_HEALTHY=false
 
-curl --fail --silent --show-error --max-time 5 \
-    http://127.0.0.1/health
+for attempt in $(seq 1 10); do
 
-echo ""
+    if curl \
+        --fail \
+        --silent \
+        --max-time 5 \
+        http://127.0.0.1/health \
+        >/dev/null; then
 
-curl --fail --silent --show-error --max-time 5 \
+        NGINX_HEALTHY=true
+
+        break
+
+    fi
+
+    echo "Nginx health check attempt $attempt/10 failed."
+
+    sleep 2
+
+done
+
+if [[ "$NGINX_HEALTHY" != "true" ]]; then
+
+    echo "ERROR: Nginx health verification failed."
+
+    exit 1
+
+fi
+
+# Verify home page.
+
+echo "Application response:"
+
+curl \
+    --fail \
+    --silent \
+    --show-error \
+    --max-time 5 \
     http://127.0.0.1/
 
 echo ""
 
-echo "Nginx application verification passed."
+# ==========================================================
+# STEP 18: SAVE CURRENT DEPLOYMENT STATE
+# ==========================================================
 
-# --------------------------------------------------
-# 13. Record successful deployment
-# --------------------------------------------------
+printf '%s\n' "$NEW_PORT" > "$CURRENT_FILE"
 
-if [[ "$HAD_ACTIVE" == "true" ]]; then
-    echo "$CURRENT_PORT" > "$PREVIOUS_FILE"
-fi
-
-echo "$NEW_PORT" > "$CURRENT_FILE"
-
-# --------------------------------------------------
-# 14. Mark deployment successful
-# --------------------------------------------------
+# ==========================================================
+# STEP 19: MARK DEPLOYMENT SUCCESSFUL
+# ==========================================================
 
 DEPLOY_SUCCESS=true
 
-trap - ERR
-
-echo ""
 echo "=========================================="
-echo "DEPLOYMENT SUCCESSFUL"
+echo "ZERO-DOWNTIME DEPLOYMENT SUCCESSFUL"
 echo "=========================================="
 
-echo "Docker image: $IMAGE"
-echo "Active port: $NEW_PORT"
-echo "Active container: $NEW_CONTAINER"
+echo "Docker Image: $IMAGE"
+echo "Build ID: $BUILD_ID"
+echo "Active Port: $NEW_PORT"
+echo "Application URL: http://3.239.220.63/"
+echo "Health URL: http://3.239.220.63/health"
+
+echo "=========================================="
 
 if [[ "$HAD_ACTIVE" == "true" ]]; then
-    echo "Previous container retained: $CURRENT_CONTAINER"
-    echo "Previous port: $CURRENT_PORT"
-    echo "Previous port recorded in: $PREVIOUS_FILE"
+
+    echo "Previous container $CURRENT_CONTAINER retained for rollback."
+
 else
-    echo "This was the initial deployment."
+
+    echo "Initial deployment completed."
+
 fi
 
-echo "Current port recorded in: $CURRENT_FILE"
-
 echo "=========================================="
-```
+
+exit 0
