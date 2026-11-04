@@ -11,17 +11,20 @@ pipeline {
         choice(
             name: 'APP_VERSION',
             choices: ['v1', 'v2'],
-            description: 'Application version to deploy'
+            description: 'Select the Flask application version to deploy'
         )
+
         booleanParam(
             name: 'SIMULATE_FAILURE',
             defaultValue: false,
-            description: 'Force candidate health check failure'
+            description: 'Simulate candidate health check failure to test rollback'
         )
     }
 
     environment {
         DOCKERHUB_REPOSITORY = 'flask-bluegreen-demo'
+
+        // Replace with your CURRENT Application EC2 public IPv4.
         APP_HOST = '3.239.220.63'
     }
 
@@ -29,6 +32,7 @@ pipeline {
 
         stage('Checkout') {
             steps {
+                echo 'Checking out application source code from GitHub...'
                 checkout scm
             }
         }
@@ -36,18 +40,22 @@ pipeline {
         stage('Validate') {
             steps {
                 sh '''
-                    set -e
+                    set -eu
 
-                    if [ "$APP_VERSION" = "v1" ]; then
-                        APP_DIR="version1"
-                    elif [ "$APP_VERSION" = "v2" ]; then
-                        APP_DIR="version2"
-                    else
-                        echo "Invalid application version"
-                        exit 1
-                    fi
+                    case "$APP_VERSION" in
+                        v1)
+                            APP_DIR="version1"
+                            ;;
+                        v2)
+                            APP_DIR="version2"
+                            ;;
+                        *)
+                            echo "ERROR: Invalid application version"
+                            exit 1
+                            ;;
+                    esac
 
-                    echo "Validating $APP_DIR"
+                    echo "Validating application directory: $APP_DIR"
 
                     test -f "$APP_DIR/app.py"
                     test -f "$APP_DIR/Dockerfile"
@@ -70,26 +78,40 @@ pipeline {
                     )
                 ]) {
                     sh '''
-                        set -e
+                        set -eu
 
-                        if [ "$APP_VERSION" = "v1" ]; then
-                            APP_DIR="version1"
-                        else
-                            APP_DIR="version2"
-                        fi
+                        case "$APP_VERSION" in
+                            v1)
+                                APP_DIR="version1"
+                                ;;
+                            v2)
+                                APP_DIR="version2"
+                                ;;
+                        esac
 
                         IMAGE="$DH_USER/$DOCKERHUB_REPOSITORY"
 
+                        echo "Logging in to Docker Hub..."
+
                         echo "$DH_TOKEN" | docker login \
-                            -u "$DH_USER" --password-stdin
+                            --username "$DH_USER" \
+                            --password-stdin
+
+                        echo "Building Docker image..."
 
                         docker build \
+                            --pull \
                             -t "$IMAGE:$BUILD_NUMBER" \
                             -t "$IMAGE:latest" \
                             -f "$APP_DIR/Dockerfile" \
                             "$APP_DIR"
 
+                        echo "Pushing versioned image..."
+
                         docker push "$IMAGE:$BUILD_NUMBER"
+
+                        echo "Pushing latest image..."
+
                         docker push "$IMAGE:latest"
 
                         docker logout
@@ -121,24 +143,45 @@ pipeline {
                             )
                         ]) {
                             sh '''
-                                set -e
+                                set -eu
+
+                                echo "Validating Application EC2 configuration..."
 
                                 test -n "$APP_HOST"
-                                test "$APP_HOST" != "3.239.220.63"
+
+                                if [ "$APP_HOST" = "3.239.220.63" ]; then
+                                    echo "ERROR: Configure the actual Application EC2 public IP in Jenkinsfile."
+                                    exit 1
+                                fi
 
                                 chmod 600 "$SSH_KEY"
 
+                                echo "Testing SSH connectivity..."
+
+                                ssh -i "$SSH_KEY" \
+                                    -o BatchMode=yes \
+                                    -o ConnectTimeout=10 \
+                                    -o StrictHostKeyChecking=accept-new \
+                                    "$SSH_USER@$APP_HOST" \
+                                    "echo SSH connection successful"
+
+                                echo "Copying deployment script to Application EC2..."
+
                                 scp -i "$SSH_KEY" \
+                                    -o ConnectTimeout=10 \
                                     -o StrictHostKeyChecking=accept-new \
                                     scripts/deploy.sh \
                                     "$SSH_USER@$APP_HOST:/tmp/deploy.sh"
 
+                                echo "Executing deployment script..."
+
                                 ssh -i "$SSH_KEY" \
+                                    -o ConnectTimeout=10 \
                                     -o StrictHostKeyChecking=accept-new \
                                     "$SSH_USER@$APP_HOST" \
                                     "chmod +x /tmp/deploy.sh && sudo /tmp/deploy.sh '$IMAGE_NAME' '$BUILD_NUMBER' '$SIMULATE_FAILURE_VALUE'"
 
-                                echo "Deployment script executed"
+                                echo "Deployment script executed successfully"
                             '''
                         }
                     }
@@ -149,15 +192,30 @@ pipeline {
         stage('Verify') {
             steps {
                 sh '''
-                    set -e
+                    set -eu
 
-                    echo "Checking application health..."
+                    echo "Waiting for application to respond..."
 
-                    curl --fail --silent --show-error \
-                        --max-time 10 \
-                        "http://$APP_HOST/health"
+                    ATTEMPTS=10
+                    COUNT=0
 
-                    echo "Application health check successful"
+                    until curl --fail --silent --show-error \
+                        --max-time 5 \
+                        "http://$APP_HOST/health"; do
+
+                        COUNT=$((COUNT + 1))
+
+                        if [ "$COUNT" -ge "$ATTEMPTS" ]; then
+                            echo "ERROR: Application health verification failed"
+                            exit 1
+                        fi
+
+                        echo "Health check attempt $COUNT failed. Retrying..."
+                        sleep 3
+                    done
+
+                    echo ""
+                    echo "Application health verification successful"
                 '''
             }
         }
@@ -165,7 +223,12 @@ pipeline {
 
     post {
         always {
-            sh 'docker image prune -f || true'
+            echo 'Performing Jenkins workspace cleanup...'
+
+            sh '''
+                docker image prune -f || true
+            '''
+
             archiveArtifacts(
                 artifacts: 'image.env',
                 allowEmptyArchive: true
@@ -173,11 +236,17 @@ pipeline {
         }
 
         success {
-            echo 'Deployment completed successfully.'
+            echo 'SUCCESS: Deployment pipeline completed successfully.'
+            echo 'Application health verification passed.'
         }
 
         failure {
-            echo 'Pipeline failed. Review the Jenkins console output and deployment logs.'
+            echo 'FAILURE: Pipeline execution failed.'
+            echo 'Check the Jenkins console output and Application EC2 deployment logs.'
+        }
+
+        aborted {
+            echo 'Pipeline execution was aborted.'
         }
     }
 }
