@@ -1,269 +1,382 @@
 
-pipeline {
-    agent any
+#!/usr/bin/env bash
 
-    options {
-        timestamps()
-        disableConcurrentBuilds()
-        skipDefaultCheckout(true)
-    }
+set -Eeuo pipefail
 
-    parameters {
-        choice(
-            name: 'APP_VERSION',
-            choices: ['v1', 'v2'],
-            description: 'Select Flask application version'
-        )
+# ==========================================================
+# ZERO-DOWNTIME FLASK DEPLOYMENT
+# Docker + Nginx + AWS EC2
+# ==========================================================
 
-        booleanParam(
-            name: 'SIMULATE_FAILURE',
-            defaultValue: false,
-            description: 'Simulate candidate application health-check failure'
-        )
-    }
+# Arguments passed by Jenkins
+IMAGE="${1:?Usage: deploy.sh IMAGE BUILD_ID [SIMULATE_FAILURE]}"
+BUILD_ID="${2:?Build ID is required}"
+SIMULATE_FAILURE="${3:-false}"
 
-    environment {
-        DOCKERHUB_REPOSITORY = 'flask-bluegreen-demo'
-        APP_HOST = '3.239.220.63'
-        APP_USER = 'ubuntu'
-    }
+# Application configuration
+APP_DIR="/opt/bluegreen"
+UPSTREAM_FILE="/etc/nginx/active-upstream.inc"
 
-    stages {
+CURRENT_FILE="$APP_DIR/current-port"
+PREVIOUS_FILE="$APP_DIR/previous-port"
 
-        stage('Checkout') {
-            steps {
-                echo 'Checking out source code from GitHub'
+BACKUP_FILE="$APP_DIR/upstream-backup-$BUILD_ID.conf"
 
-                checkout scm
+# Deployment state
+DEPLOY_SUCCESS=false
+CANDIDATE_STARTED=false
+UPSTREAM_CHANGED=false
+HAD_ACTIVE=false
 
-                sh '''
-                    echo "Repository files:"
-                    ls -la
-                '''
-            }
-        }
+# ==========================================================
+# STEP 1: CHECK ROOT PRIVILEGES
+# ==========================================================
 
-        stage('Validate') {
-            steps {
-                script {
-                    if (params.APP_VERSION == 'v1') {
-                        env.APP_DIR = 'version1'
-                        env.EXPECTED_VERSION = '1.0.0'
-                    } else {
-                        env.APP_DIR = 'version2'
-                        env.EXPECTED_VERSION = '2.0.0'
-                    }
+if [[ "$EUID" -ne 0 ]]; then
+    echo "ERROR: Run this script using sudo."
+    exit 1
+fi
 
-                    env.SIMULATE_FAILURE_VALUE =
-                        params.SIMULATE_FAILURE ? 'true' : 'false'
-                }
+echo "=========================================="
+echo "ZERO-DOWNTIME DEPLOYMENT STARTED"
+echo "=========================================="
 
-                sh '''
-                    set -eu
+echo "Docker image: $IMAGE"
+echo "Build ID: $BUILD_ID"
+echo "Simulate failure: $SIMULATE_FAILURE"
 
-                    echo "Selected application: $APP_DIR"
-                    echo "Expected version: $EXPECTED_VERSION"
+# ==========================================================
+# STEP 2: CHECK REQUIRED COMMANDS
+# ==========================================================
 
-                    test -f "$APP_DIR/app.py"
-                    test -f "$APP_DIR/Dockerfile"
-                    test -f "$APP_DIR/requirements.txt"
+for command in docker nginx curl systemctl grep awk; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+        echo "ERROR: Required command not found: $command"
+        exit 1
+    fi
+done
 
-                    test -f scripts/deploy.sh
+# ==========================================================
+# STEP 3: PREPARE APPLICATION DIRECTORY
+# ==========================================================
 
-                    python3 -m py_compile "$APP_DIR/app.py"
+mkdir -p "$APP_DIR"
 
-                    bash -n scripts/deploy.sh
+# ==========================================================
+# STEP 4: CHECK NGINX UPSTREAM CONFIGURATION
+# ==========================================================
 
-                    echo "Application and deployment script validation passed"
-                '''
-            }
-        }
+if [[ ! -s "$UPSTREAM_FILE" ]]; then
+    echo "Creating initial Nginx upstream configuration."
 
-        stage('Build Docker Image') {
-            steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'dockerhub-creds',
-                        usernameVariable: 'DH_USER',
-                        passwordVariable: 'DH_TOKEN'
-                    )
-                ]) {
-                    script {
-                        env.IMAGE_NAME =
-                            "${DH_USER}/${env.DOCKERHUB_REPOSITORY}:${env.BUILD_NUMBER}"
+    echo "server 127.0.0.1:5001 max_fails=3 fail_timeout=10s;" \
+        > "$UPSTREAM_FILE"
+fi
 
-                        env.LATEST_IMAGE =
-                            "${DH_USER}/${env.DOCKERHUB_REPOSITORY}:latest"
-                    }
+CURRENT_PORT="$(
+    grep -oE '127\.0\.0\.1:500[12]' "$UPSTREAM_FILE" |
+    head -n 1 |
+    awk -F: '{print $2}' || true
+)"
 
-                    sh '''
-                        set -eu
+if [[ "$CURRENT_PORT" != "5001" && "$CURRENT_PORT" != "5002" ]]; then
+    echo "ERROR: Invalid Nginx upstream configuration."
+    exit 1
+fi
 
-                        echo "Logging in to Docker Hub"
+# ==========================================================
+# STEP 5: IDENTIFY ACTIVE CONTAINER
+# ==========================================================
 
-                        echo "$DH_TOKEN" | docker login \
-                            --username "$DH_USER" \
-                            --password-stdin
+CURRENT_CONTAINER="bluegreen-$CURRENT_PORT"
 
-                        echo "Building Docker image"
+if docker ps --format '{{.Names}}' |
+    grep -qx "$CURRENT_CONTAINER"; then
 
-                        docker build \
-                            --pull \
-                            -t "$IMAGE_NAME" \
-                            -t "$LATEST_IMAGE" \
-                            -f "$APP_DIR/Dockerfile" \
-                            "$APP_DIR"
+    HAD_ACTIVE=true
 
-                        echo "Docker image built successfully"
+    if [[ "$CURRENT_PORT" == "5001" ]]; then
+        NEW_PORT=5002
+    else
+        NEW_PORT=5001
+    fi
 
-                        docker image inspect "$IMAGE_NAME" >/dev/null
+else
+    HAD_ACTIVE=false
+    NEW_PORT="$CURRENT_PORT"
+fi
 
-                        docker logout
-                    '''
-                }
-            }
-        }
+NEW_CONTAINER="bluegreen-$NEW_PORT"
 
-        stage('Push Docker Image') {
-            steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'dockerhub-creds',
-                        usernameVariable: 'DH_USER',
-                        passwordVariable: 'DH_TOKEN'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
+echo "Current port: $CURRENT_PORT"
+echo "New deployment port: $NEW_PORT"
+echo "Current container: $CURRENT_CONTAINER"
+echo "New container: $NEW_CONTAINER"
 
-                        echo "$DH_TOKEN" | docker login \
-                            --username "$DH_USER" \
-                            --password-stdin
+# ==========================================================
+# STEP 6: BACK UP CURRENT NGINX CONFIGURATION
+# ==========================================================
 
-                        echo "Pushing versioned image: $IMAGE_NAME"
+cp "$UPSTREAM_FILE" "$BACKUP_FILE"
 
-                        docker push "$IMAGE_NAME"
+echo "Nginx upstream backup created: $BACKUP_FILE"
 
-                        echo "Updating latest image tag"
+# ==========================================================
+# STEP 7: AUTOMATIC ROLLBACK FUNCTION
+# ==========================================================
 
-                        docker push "$LATEST_IMAGE"
+rollback_on_exit() {
 
-                        docker logout
+    local EXIT_CODE=$?
 
-                        echo "Docker images pushed successfully"
-                    '''
-                }
-            }
-        }
+    trap - EXIT
 
-        stage('Deploy to Application EC2') {
-            steps {
-                sshagent(credentials: ['app-server-ssh']) {
-                    sh '''
-                        set -eu
+    if [[ "$DEPLOY_SUCCESS" != "true" ]]; then
 
-                        REMOTE_SCRIPT="/tmp/bluegreen-deploy-${BUILD_NUMBER}.sh"
+        echo ""
+        echo "=========================================="
+        echo "DEPLOYMENT FAILED - ROLLBACK STARTED"
+        echo "=========================================="
 
-                        echo "Copying deployment script to Application EC2"
+        # Restore previous Nginx upstream only
+        # if the candidate switch was attempted.
 
-                        scp \
-                            -o StrictHostKeyChecking=no \
-                            -o UserKnownHostsFile=/dev/null \
-                            -o ConnectTimeout=10 \
-                            scripts/deploy.sh \
-                            "$APP_USER@$APP_HOST:$REMOTE_SCRIPT"
+        if [[ "$UPSTREAM_CHANGED" == "true" ]]; then
 
-                        echo "Starting remote blue-green deployment"
+            if [[ -f "$BACKUP_FILE" ]]; then
 
-                        ssh \
-                            -o StrictHostKeyChecking=no \
-                            -o UserKnownHostsFile=/dev/null \
-                            -o ConnectTimeout=10 \
-                            "$APP_USER@$APP_HOST" \
-                            "sudo bash '$REMOTE_SCRIPT' '$IMAGE_NAME' '$BUILD_NUMBER' '$SIMULATE_FAILURE_VALUE'"
+                cp "$BACKUP_FILE" "$UPSTREAM_FILE"
 
-                        echo "Remote deployment script completed"
-                    '''
-                }
-            }
-        }
+                if nginx -t; then
+                    systemctl reload nginx
+                    echo "Previous Nginx upstream restored."
+                else
+                    echo "WARNING: Restored Nginx configuration is invalid."
+                fi
 
-        stage('Verify Deployment') {
-            steps {
-                sh '''
-                    set -eu
+            fi
 
-                    echo "Checking application health through Nginx"
+        fi
 
-                    HEALTH_RESPONSE=$(curl \
-                        --fail \
-                        --silent \
-                        --show-error \
-                        --retry 10 \
-                        --retry-delay 3 \
-                        --retry-connrefused \
-                        --max-time 5 \
-                        "http://$APP_HOST/health")
+        # Remove failed candidate container.
 
-                    echo "$HEALTH_RESPONSE"
+        if [[ "$CANDIDATE_STARTED" == "true" ]]; then
 
-                    echo "Checking application version"
+            docker rm -f "$NEW_CONTAINER" \
+                >/dev/null 2>&1 || true
 
-                    APP_RESPONSE=$(curl \
-                        --fail \
-                        --silent \
-                        --show-error \
-                        --retry 5 \
-                        --retry-delay 2 \
-                        --retry-connrefused \
-                        --max-time 5 \
-                        "http://$APP_HOST/")
+            echo "Failed candidate container removed."
 
-                    echo "$APP_RESPONSE"
+        fi
 
-                    printf '%s' "$APP_RESPONSE" |
-                        grep -Eq "\\"version\\"[[:space:]]*:[[:space:]]*\\"$EXPECTED_VERSION\\""
+        echo "=========================================="
+        echo "ROLLBACK PROCEDURE FINISHED"
+        echo "=========================================="
 
-                    echo "Application version verified: $EXPECTED_VERSION"
-                    echo "Zero-downtime deployment verification passed"
-                '''
-            }
-        }
-    }
+    fi
 
-    post {
-        success {
-            echo """
-            ==========================================
-            DEPLOYMENT SUCCESSFUL
-            ==========================================
-            Application Version: ${params.APP_VERSION}
-            Expected Version: ${env.EXPECTED_VERSION}
-            Docker Image: ${env.IMAGE_NAME}
-            Application Server: ${env.APP_HOST}
-            ==========================================
-            """
-        }
-
-        failure {
-            echo """
-            ==========================================
-            DEPLOYMENT FAILED
-            ==========================================
-            Check the Jenkins Console Output.
-            If candidate deployment failed, inspect
-            the Application EC2 rollback logs.
-            ==========================================
-            """
-        }
-
-        always {
-            archiveArtifacts(
-                artifacts: 'image.env',
-                allowEmptyArchive: true
-            )
-
-            echo 'Jenkins pipeline execution completed'
-        }
-    }
+    exit "$EXIT_CODE"
 }
+
+trap rollback_on_exit EXIT
+
+# ==========================================================
+# STEP 8: PULL DOCKER IMAGE
+# ==========================================================
+
+echo "Pulling Docker image: $IMAGE"
+
+docker pull "$IMAGE"
+
+# ==========================================================
+# STEP 9: REMOVE OLD INACTIVE CANDIDATE
+# ==========================================================
+
+echo "Removing any old candidate container."
+
+docker rm -f "$NEW_CONTAINER" \
+    >/dev/null 2>&1 || true
+
+# ==========================================================
+# STEP 10: START NEW CANDIDATE CONTAINER
+# ==========================================================
+
+FAIL_FLAG=false
+
+if [[ "$SIMULATE_FAILURE" == "true" ]]; then
+    FAIL_FLAG=true
+fi
+
+echo "Starting candidate application."
+
+CANDIDATE_STARTED=true
+
+docker run -d \
+    --restart unless-stopped \
+    --name "$NEW_CONTAINER" \
+    -e FAIL_HEALTH_CHECK="$FAIL_FLAG" \
+    -p "127.0.0.1:$NEW_PORT:5000" \
+    "$IMAGE"
+
+echo "Candidate container started."
+
+# ==========================================================
+# STEP 11: CHECK CANDIDATE APPLICATION HEALTH
+# ==========================================================
+
+echo "Checking candidate application health."
+
+HEALTHY=false
+
+for attempt in $(seq 1 20); do
+
+    if curl \
+        --fail \
+        --silent \
+        --max-time 3 \
+        "http://127.0.0.1:$NEW_PORT/health" \
+        >/dev/null; then
+
+        HEALTHY=true
+        echo "Candidate health check successful."
+        break
+
+    fi
+
+    echo "Health check attempt $attempt/20 failed."
+
+    sleep 2
+
+done
+
+if [[ "$HEALTHY" != "true" ]]; then
+
+    echo "ERROR: Candidate application is unhealthy."
+
+    exit 1
+
+fi
+
+# ==========================================================
+# STEP 12: SAVE PREVIOUS ACTIVE PORT
+# ==========================================================
+
+if [[ "$HAD_ACTIVE" == "true" ]]; then
+
+    echo "$CURRENT_PORT" > "$PREVIOUS_FILE"
+
+    echo "Previous active port saved: $CURRENT_PORT"
+
+fi
+
+# ==========================================================
+# STEP 13: SWITCH NGINX TO NEW APPLICATION
+# ==========================================================
+
+echo "Switching Nginx traffic to candidate."
+
+UPSTREAM_CHANGED=true
+
+echo "server 127.0.0.1:$NEW_PORT max_fails=3 fail_timeout=10s;" \
+    > "$UPSTREAM_FILE"
+
+# ==========================================================
+# STEP 14: VALIDATE NGINX CONFIGURATION
+# ==========================================================
+
+echo "Testing Nginx configuration."
+
+nginx -t
+
+# ==========================================================
+# STEP 15: RELOAD NGINX
+# ==========================================================
+
+echo "Reloading Nginx."
+
+systemctl reload nginx
+
+# ==========================================================
+# STEP 16: VERIFY THROUGH NGINX
+# ==========================================================
+
+echo "Verifying application through Nginx."
+
+NGINX_HEALTHY=false
+
+for attempt in $(seq 1 10); do
+
+    if curl \
+        --fail \
+        --silent \
+        --max-time 5 \
+        http://127.0.0.1/health \
+        >/dev/null; then
+
+        NGINX_HEALTHY=true
+        break
+
+    fi
+
+    echo "Nginx health check attempt $attempt/10 failed."
+
+    sleep 2
+
+done
+
+if [[ "$NGINX_HEALTHY" != "true" ]]; then
+
+    echo "ERROR: Nginx health verification failed."
+
+    exit 1
+
+fi
+
+# Verify home page too.
+
+curl \
+    --fail \
+    --silent \
+    --show-error \
+    --max-time 5 \
+    http://127.0.0.1/
+
+echo ""
+
+# ==========================================================
+# STEP 17: SAVE CURRENT DEPLOYMENT STATE
+# ==========================================================
+
+echo "$NEW_PORT" > "$CURRENT_FILE"
+
+# ==========================================================
+# STEP 18: MARK DEPLOYMENT SUCCESSFUL
+# ==========================================================
+
+DEPLOY_SUCCESS=true
+
+echo "=========================================="
+echo "ZERO-DOWNTIME DEPLOYMENT SUCCESSFUL"
+echo "=========================================="
+
+echo "Docker Image: $IMAGE"
+echo "Build ID: $BUILD_ID"
+echo "Active Port: $NEW_PORT"
+echo "Application URL: http://3.239.220.63/"
+echo "Health URL: http://3.239.220.63/health"
+
+echo "=========================================="
+
+if [[ "$HAD_ACTIVE" == "true" ]]; then
+
+    echo "Previous container $CURRENT_CONTAINER retained for rollback."
+
+else
+
+    echo "Initial deployment completed."
+
+fi
+
+echo "=========================================="
+
+exit 0
