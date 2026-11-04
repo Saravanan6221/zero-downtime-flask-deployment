@@ -7,7 +7,7 @@ pipeline {
     }
     environment {
         DOCKERHUB_REPOSITORY = 'flask-bluegreen-demo'
-        APP_HOST = 'REPLACE_WITH_APP_EC2_PUBLIC_IP'
+        APP_HOST = '3.239.220.63'
     }
     stages {
         stage('Checkout') { steps { checkout scm } }
@@ -46,7 +46,7 @@ pipeline {
                         withCredentials([sshUserPrivateKey(credentialsId: 'app-server-ssh', keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
                             sh '''
                                 set -e
-                                test "$APP_HOST" != "REPLACE_WITH_APP_EC2_PUBLIC_IP"
+                                test "$APP_HOST" != "3.239.220.63"
                                 chmod 600 "$SSH_KEY"
                                 scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new scripts/deploy.sh "$SSH_USER@$APP_HOST:/tmp/deploy.sh"
                                 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$SSH_USER@$APP_HOST" "chmod +x /tmp/deploy.sh && sudo /tmp/deploy.sh '$IMAGE_NAME' '$BUILD_NUMBER' '$SIMULATE_FAILURE_VALUE'"
