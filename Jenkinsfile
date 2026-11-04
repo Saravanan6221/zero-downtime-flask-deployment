@@ -42,14 +42,16 @@ pipeline {
             steps {
                 script {
                     def imageName = readFile('image.env').trim().replace('IMAGE=', '')
-                    withCredentials([sshUserPrivateKey(credentialsId: 'app-server-ssh', keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
-                        sh """
-                            set -e
-                            test "$APP_HOST" != "REPLACE_WITH_APP_EC2_PUBLIC_IP"
-                            chmod 600 "$SSH_KEY"
-                            scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new scripts/deploy.sh "$SSH_USER@$APP_HOST:/tmp/deploy.sh"
-                            ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$SSH_USER@$APP_HOST" "chmod +x /tmp/deploy.sh && sudo /tmp/deploy.sh '${imageName}' '${BUILD_NUMBER}' '${params.SIMULATE_FAILURE}'"
-                        """
+                    withEnv(["IMAGE_NAME=${imageName}", "SIMULATE_FAILURE_VALUE=${params.SIMULATE_FAILURE}"]) {
+                        withCredentials([sshUserPrivateKey(credentialsId: 'app-server-ssh', keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
+                            sh '''
+                                set -e
+                                test "$APP_HOST" != "REPLACE_WITH_APP_EC2_PUBLIC_IP"
+                                chmod 600 "$SSH_KEY"
+                                scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new scripts/deploy.sh "$SSH_USER@$APP_HOST:/tmp/deploy.sh"
+                                ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$SSH_USER@$APP_HOST" "chmod +x /tmp/deploy.sh && sudo /tmp/deploy.sh '$IMAGE_NAME' '$BUILD_NUMBER' '$SIMULATE_FAILURE_VALUE'"
+                            '''
+                        }
                     }
                 }
             }
